@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="miui_blue">#3478F6</color>
+    <color name="miui_blue_dark">#235ECD</color>
+    <color name="miui_bg">#F5F6F8</color>
+    <color name="miui_card">#FFFFFFFF</color>
+    <color name="miui_text">#1F2329</color>
+    <color name="miui_secondary">#858C99</color>
+    <color name="miui_tertiary">#A8AFBA</color>
+    <color name="miui_line">#E7E9EE</color>
+    <color name="miui_green">#12B76A</color>
+    <color name="miui_orange">#F79009</color>
+    <color name="miui_red">#F04438</color>
+    <color name="miui_blue_tint">#EAF2FF</color>
+    <color name="miui_green_tint">#E9F8F0</color>
+    <color name="miui_orange_tint">#FFF3E8</color>
+    <color name="miui_gray_tint">#F1F3F7</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

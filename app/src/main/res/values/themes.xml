@@ -1,0 +1,19 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.Test" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/miui_blue</item>
+        <item name="colorPrimaryVariant">@color/miui_blue_dark</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorSecondary">@color/miui_blue</item>
+        <item name="colorSecondaryVariant">@color/miui_blue_dark</item>
+        <item name="colorOnSecondary">@color/white</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:statusBarColor">@color/miui_bg</item>
+        <item name="android:navigationBarColor">@color/miui_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
+        <item name="android:colorAccent">@color/miui_blue</item>
+        <item name="android:windowBackground">@color/miui_bg</item>
+    </style>
+</resources>
