@@ -23,6 +23,10 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import com.funnyass.test.CmdServer
 import com.funnyass.test.Logger
 import com.funnyass.test.R
@@ -52,6 +56,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     private lateinit var deviceTitleTv: TextView
     private lateinit var deviceDetailTv: TextView
     private lateinit var deviceMacTv: TextView
+    private lateinit var bindStatusTv: TextView
+    private lateinit var filterToggleTv: TextView
     private lateinit var deviceIdValueTv: TextView
     private lateinit var connectionValueTv: TextView
     private lateinit var protocolValueTv: TextView
@@ -68,9 +74,20 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
 
     private var user: UserInfo? = null
     private var device: DeviceInfo? = null
-    private val devices = LinkedHashMap<String, BluetoothDevice>()
+    // 扫描全量结果（mac → 设备信息），列表渲染按当前过滤模式从其中取值
+    private val scanResults = LinkedHashMap<String, ScanEntry>()
+    // 当前列表可见设备的 MAC 顺序，点击列表项时按此取设备（过滤后与 scanResults 顺序不一致）
+    private val visibleMacs = mutableListOf<String>()
     private lateinit var adapter: ArrayAdapter<String>
     private var selectedMac: String? = null
+
+    // 绑定设备：连接成功后记住，下次启动自动尝试连接
+    private var boundMac: String? = null
+    private var boundName: String? = null
+    private var autoConnecting = false
+    private var pendingAutoConnectMac: String? = null
+    // 附近设备列表是否显示全部蓝牙设备（false = 仅显示 KLCXKJ 水表）
+    private var showAllDevices = false
 
     private var protocolType = "20"
     private var randomNumber = ""
@@ -123,6 +140,14 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_bath)
+        // targetSdk 37 强制 edge-to-edge，需按系统栏 inset 避让状态栏/导航栏
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val root = findViewById<View>(R.id.bath_root)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.updatePadding(top = bars.top, bottom = bars.bottom)
+            insets
+        }
         statusTv = findViewById(R.id.status)
         logTv = findViewById(R.id.log)
         deviceList = findViewById(R.id.device_list)
@@ -132,6 +157,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         deviceTitleTv = findViewById(R.id.device_title)
         deviceDetailTv = findViewById(R.id.device_detail)
         deviceMacTv = findViewById(R.id.device_mac)
+        bindStatusTv = findViewById(R.id.bind_status)
+        filterToggleTv = findViewById(R.id.filter_toggle)
         deviceIdValueTv = findViewById(R.id.device_id_value)
         connectionValueTv = findViewById(R.id.connection_value)
         protocolValueTv = findViewById(R.id.protocol_value)
@@ -149,9 +176,10 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
         deviceList.adapter = adapter
         deviceList.setOnItemClickListener { _, _, pos, _ ->
-            val mac = devices.keys.elementAtOrNull(pos) ?: return@setOnItemClickListener
+            val mac = visibleMacs.getOrNull(pos) ?: return@setOnItemClickListener
             device = null
             selectedMac = mac
+            autoConnecting = false
             macInput.setText(mac)
             renderDevice()
             connectDevice(mac)
@@ -169,6 +197,9 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
 
         user = Session.loadUser(this)
         restorePendingRate()
+        boundMac = Session.loadBoundMac(this)
+        boundName = Session.loadBoundName(this)
+        showAllDevices = Session.isShowAllDevices(this)
         ble = BleManager(this)
         ble.listener = this
         ApiClient.setAuthInvalidListener(authInvalidListener)
@@ -176,17 +207,24 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         selectedMac = macInput.text.toString().trim().takeIf { it.isNotEmpty() }
         renderUser()
         renderDevice()
+        renderBindStatus()
+        renderScanList()
         renderConnection()
 
         connectBtn.setOnClickListener {
             val m = macInput.text.toString().trim()
-            if (m.isNotEmpty()) connectDevice(m)
+            if (m.isNotEmpty()) {
+                autoConnecting = false
+                connectDevice(m)
+            }
         }
         scanBtn.setOnClickListener { scanDevices() }
         startBtn.setOnClickListener { startBath() }
         stopBtn.setOnClickListener { stopBath() }
         disconnectBtn.setOnClickListener { disconnectDev() }
         reloginBtn.setOnClickListener { requestRelogin() }
+        filterToggleTv.setOnClickListener { toggleDeviceFilter() }
+        bindStatusTv.setOnClickListener { if (boundMac != null) confirmUnbindDevice() }
         findViewById<TextView>(R.id.refresh_btn).setOnClickListener { refreshUser() }
         advancedToggle.setOnClickListener {
             val expanded = advancedPanel.visibility != View.VISIBLE
@@ -196,7 +234,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
 
         refreshUser()
         CmdServer.start(this)
-        scanDevices()
+        startInitialDeviceFlow()
     }
 
     override fun onResume() {
@@ -248,6 +286,21 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         deviceMacTv.text = "MAC " + (mac ?: "--")
         deviceIdValueTv.text = if (d?.devID ?: 0 > 0) d?.devID.toString() else "--"
         protocolValueTv.text = if (hasSelection) protocolType.takeIf { it.isNotBlank() } ?: "--" else "--"
+    }
+
+    /** 渲染绑定状态行：未绑定为淡色提示，已绑定为可点击的解除入口 */
+    private fun renderBindStatus() {
+        val mac = boundMac
+        if (mac.isNullOrBlank()) {
+            bindStatusTv.text = "连接成功后将记住该设备，下次启动自动连接"
+            bindStatusTv.setTextColor(ContextCompat.getColor(this, R.color.miui_tertiary))
+            bindStatusTv.isClickable = false
+            return
+        }
+        val label = boundName?.takeIf { it.isNotBlank() } ?: mac
+        bindStatusTv.text = "已记住 " + label + " · 启动时自动连接 · 点此解除"
+        bindStatusTv.setTextColor(ContextCompat.getColor(this, R.color.miui_blue))
+        bindStatusTv.isClickable = true
     }
 
     private fun renderConnection() {
@@ -330,6 +383,7 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                         device = r.data
                         renderDevice()
                         updateActionButtons()
+                        refreshBoundName(mac, r.data)
                     } else {
                         deviceTitleTv.text = "已选择洗澡设备"
                         deviceDetailTv.text = "设备详情暂时无法读取，仍可连接后重试"
@@ -449,6 +503,9 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
             toast("请先停止并结算当前用水")
             return
         }
+        // 手动扫描接管流程，作废未完成的自动连接状态
+        autoConnecting = false
+        pendingAutoConnectMac = null
         if (connected) {
             ble.disconnect()
             connected = false
@@ -459,11 +516,125 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         randomNumber = ""
         selectedMac = null
         macInput.text.clear()
-        devices.clear()
-        adapter.clear()
+        scanResults.clear()
+        renderScanList()
         renderDevice()
         setStatusText("正在扫描附近设备…")
         ble.startScan()
+    }
+
+    /** 启动流程：已绑定设备则自动连接，否则直接扫描（保持原行为） */
+    private fun startInitialDeviceFlow() {
+        val mac = boundMac
+        if (mac.isNullOrBlank()) {
+            scanDevices()
+            return
+        }
+        selectedMac = mac
+        macInput.setText(mac)
+        renderDevice()
+        if (!ensurePermissions()) {
+            // 权限请求结果回调里继续自动连接
+            pendingAutoConnectMac = mac
+            return
+        }
+        requestAutoConnect(mac)
+    }
+
+    /** 尝试连接已绑定设备；蓝牙未开启时先请求开启，开启后继续 */
+    private fun requestAutoConnect(mac: String) {
+        if (!ble.isEnabled) {
+            pendingAutoConnectMac = mac
+            setStatusText("请开启蓝牙")
+            try {
+                startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), 101)
+            } catch (_: Exception) {
+                toast("请先在系统设置中开启蓝牙")
+            }
+            return
+        }
+        pendingAutoConnectMac = null
+        autoConnecting = true
+        setStatusText("正在自动连接已记住的设备…")
+        connectDevice(mac)
+    }
+
+    /** 连接成功后记住该设备，供下次启动自动连接 */
+    private fun rememberBoundDevice() {
+        val mac = selectedMac ?: return
+        if (mac.isBlank()) return
+        // 优先用服务器返回的设备名（房间名更友好），回退到扫描到的蓝牙名或旧名字
+        val name = friendlyName(device)
+            ?: scanResults.entries.firstOrNull { it.key.equals(mac, ignoreCase = true) }?.value?.name
+            ?: boundName
+        boundMac = mac
+        boundName = name
+        Session.saveBoundDevice(this, mac, name)
+        renderBindStatus()
+        renderScanList()
+    }
+
+    /** 加载到设备详情后，用服务器名字刷新绑定显示 */
+    private fun refreshBoundName(mac: String, info: DeviceInfo) {
+        if (!mac.equals(boundMac, ignoreCase = true)) return
+        val name = friendlyName(info) ?: return
+        if (name == boundName) return
+        boundName = name
+        Session.saveBoundDevice(this, mac, name)
+        renderBindStatus()
+    }
+
+    /** 设备友好显示名：房间名优先，其次设备名 */
+    private fun friendlyName(info: DeviceInfo?): String? {
+        if (info == null) return null
+        return info.roomName?.takeIf { it.isNotBlank() } ?: info.devName?.takeIf { it.isNotBlank() }
+    }
+
+    /** 确认解除绑定：下次启动不再自动连接该设备 */
+    private fun confirmUnbindDevice() {
+        AlertDialog.Builder(this)
+            .setTitle("解除设备绑定")
+            .setMessage("解除后将不再自动连接该设备，可在下次扫描时重新选择。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("解除绑定") { _, _ ->
+                Session.clearBoundDevice(this)
+                boundMac = null
+                boundName = null
+                renderBindStatus()
+                renderScanList()
+                toast("已解除设备绑定")
+            }
+            .show()
+    }
+
+    /** 仅显示水表判断：与 linyu 一致，按名称包含 KLCXKJ-Water 过滤 */
+    private fun isWaterMeter(name: String): Boolean =
+        name.contains("KLCXKJ-Water", ignoreCase = true)
+
+    /** 切换附近设备列表过滤模式（仅水表 / 全部设备兜底） */
+    private fun toggleDeviceFilter() {
+        showAllDevices = !showAllDevices
+        Session.setShowAllDevices(this, showAllDevices)
+        renderScanList()
+        Logger.log(if (showAllDevices) "设备列表：显示全部蓝牙设备" else "设备列表：仅显示水表")
+    }
+
+    /** 按当前过滤模式重建设备列表与可见 MAC 顺序 */
+    private fun renderScanList() {
+        adapter.clear()
+        visibleMacs.clear()
+        for ((mac, entry) in scanResults) {
+            if (!showAllDevices && !isWaterMeter(entry.name)) continue
+            visibleMacs.add(mac)
+            adapter.add(scanLine(mac, entry))
+        }
+        filterToggleTv.text = if (showAllDevices) "显示全部设备 ✓" else "仅显示水表 ✓"
+    }
+
+    /** 设备行：名称（已绑定标记）· 信号强度 换行 MAC（供核对） */
+    private fun scanLine(mac: String, entry: ScanEntry): String {
+        val boundMark = if (mac.equals(boundMac, ignoreCase = true)) "（已绑定）" else ""
+        return entry.name + boundMark + "  ·  " + entry.rssi + " dBm\n" + mac
     }
 
     private fun showDevicePicker() {
@@ -741,13 +912,18 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 100 && grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-            if (ble.isEnabled) beginScan()
+            val pending = pendingAutoConnectMac
+            if (pending != null) {
+                // 权限补齐后继续自动连接已绑定设备
+                requestAutoConnect(pending)
+            } else if (ble.isEnabled) beginScan()
             else {
                 setStatusText("请开启蓝牙")
                 try { startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), 101) }
                 catch (_: Exception) { toast("请先在系统设置中开启蓝牙") }
             }
         } else if (requestCode == 100) {
+            pendingAutoConnectMac = null
             setStatusText("需要蓝牙权限")
             toast("允许蓝牙权限后才能扫描洗澡设备")
         }
@@ -757,7 +933,12 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 101) {
-            if (ble.isEnabled) beginScan() else setStatusText("蓝牙未开启")
+            if (!ble.isEnabled) {
+                setStatusText("蓝牙未开启")
+                return
+            }
+            val pending = pendingAutoConnectMac
+            if (pending != null) requestAutoConnect(pending) else beginScan()
         }
     }
 
@@ -780,12 +961,15 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
 
     override fun onScanResult(device: BluetoothDevice, rssi: Int) {
         val mac = device.address
-        val isNew = !devices.containsKey(mac)
-        devices[mac] = device
-        if (isNew) {
-            val n = try { device.name?.takeIf { it.isNotBlank() } ?: "未命名设备" }
-                catch (_: Exception) { "未命名设备" }
-            adapter.add(n + "  ·  " + rssi + " dBm\n" + mac)
+        if (scanResults.containsKey(mac)) return
+        val name = try { device.name?.takeIf { it.isNotBlank() } ?: "未命名设备" }
+            catch (_: Exception) { "未命名设备" }
+        val entry = ScanEntry(name, rssi)
+        scanResults[mac] = entry
+        // 按当前过滤模式决定是否展示（全量结果保留在 scanResults 中供兜底切换）
+        if (showAllDevices || isWaterMeter(name)) {
+            visibleMacs.add(mac)
+            adapter.add(scanLine(mac, entry))
         }
     }
 
@@ -794,6 +978,8 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
         when (state) {
             3 -> {
                 connected = true
+                autoConnecting = false
+                rememberBoundDevice()
                 advancedPanel.visibility = View.GONE
                 advancedToggle.text = "更换洗澡设备  ›"
                 setStatusText("已连接，正在确认设备状态…")
@@ -806,17 +992,29 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
                 opHandler.removeCallbacks(startVerifyTimeout)
                 opHandler.removeCallbacks(stopAckTimeout)
                 opHandler.removeCallbacks(stopVerifyTimeout)
-                if (pendingRateDate != null || isOwnActiveSession() || settlementInFlight) {
-                    startRequestInFlight = false
-                    verifyingStart = false
-                    stopRequestInFlight = false
-                    setStatusText("连接中断，请重连原设备核对")
-                } else {
-                    setStatusText("已断开")
+                when {
+                    autoConnecting -> {
+                        // 自动连接未成功（设备不在范围等）：转入手动扫描兜底
+                        autoConnecting = false
+                        setStatusText("自动连接失败，请重新选择设备")
+                        scanDevices()
+                    }
+                    pendingRateDate != null || isOwnActiveSession() || settlementInFlight -> {
+                        startRequestInFlight = false
+                        verifyingStart = false
+                        stopRequestInFlight = false
+                        setStatusText("连接中断，请重连原设备核对")
+                    }
+                    else -> setStatusText("已断开")
                 }
                 Logger.status("已断开")
             }
-            11 -> setStatusText(if (devices.isEmpty()) "未发现设备，请重试" else "请选择附近设备")
+            11 -> setStatusText(when {
+                visibleMacs.isEmpty() && !showAllDevices && scanResults.isNotEmpty() ->
+                    "未发现水表，可切换为「显示全部设备」"
+                scanResults.isEmpty() -> "未发现设备，请重试"
+                else -> "请选择附近设备"
+            })
             else -> setStatusText(msg)
         }
         renderConnection()
@@ -1162,3 +1360,9 @@ class BathActivity : AppCompatActivity(), BleManager.Listener, CmdServer.Command
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 }
+
+/** 扫描结果条目：显示名与首次发现时的信号强度 */
+private class ScanEntry(
+    val name: String,
+    val rssi: Int
+)

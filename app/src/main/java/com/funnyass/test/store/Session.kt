@@ -4,11 +4,14 @@ import android.content.Context
 import com.funnyass.test.data.UserInfo
 import com.google.gson.Gson
 
-/** 登录态与设备信息持久化（SharedPreferences） */
+/** 登录态与设备偏好持久化（SharedPreferences） */
 object Session {
     private const val SP = "qzxy_lite"
     private const val KEY_USER = "user_info"
     private const val KEY_PHONE = "user_phone_num"
+    private const val KEY_BOUND_MAC = "bound_device_mac"
+    private const val KEY_BOUND_NAME = "bound_device_name"
+    private const val KEY_SHOW_ALL_DEVICES = "scan_show_all_devices"
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(SP, Context.MODE_PRIVATE)
     private val gson = Gson()
@@ -68,5 +71,34 @@ object Session {
         val edit = sp(ctx).edit().remove(KEY_USER)
         if (!keepPhone) edit.remove(KEY_PHONE)
         edit.apply()
+    }
+
+    // ---- 绑定设备（下次启动自动连接）----
+    // 绑定的是物理水表，与账号解耦：logout 不清除，换号登录后仍自动连接同一台设备。
+
+    fun saveBoundDevice(ctx: Context, mac: String, name: String?) {
+        sp(ctx).edit()
+            .putString(KEY_BOUND_MAC, mac)
+            .putString(KEY_BOUND_NAME, name.orEmpty())
+            .apply()
+    }
+
+    fun loadBoundMac(ctx: Context): String? =
+        sp(ctx).getString(KEY_BOUND_MAC, null)?.takeIf { it.isNotBlank() }
+
+    fun loadBoundName(ctx: Context): String? =
+        sp(ctx).getString(KEY_BOUND_NAME, null)?.takeIf { it.isNotBlank() }
+
+    fun clearBoundDevice(ctx: Context) {
+        sp(ctx).edit().remove(KEY_BOUND_MAC).remove(KEY_BOUND_NAME).apply()
+    }
+
+    // ---- 附近设备列表过滤模式（默认仅显示 KLCXKJ 水表）----
+
+    fun isShowAllDevices(ctx: Context): Boolean =
+        sp(ctx).getBoolean(KEY_SHOW_ALL_DEVICES, false)
+
+    fun setShowAllDevices(ctx: Context, value: Boolean) {
+        sp(ctx).edit().putBoolean(KEY_SHOW_ALL_DEVICES, value).apply()
     }
 }
